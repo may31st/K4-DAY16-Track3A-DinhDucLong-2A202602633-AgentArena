@@ -70,7 +70,46 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers.citation_checker import norm, quoted_in, source_of
+
 from harness.middleware import Middleware
+
+
+JOINER = " và "
+ABSTAIN_ANSWER = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi này."
+#: Trần của scorer: quá số này thì claim bị chấm REDUNDANT / EXCESS (phạt 1.0).
+MAX_PER_DOC = 4
+MAX_CLAIMS = 10
+
+
+def _grounded(ctx, text) -> bool:
+    """Agent đã thấy câu này VÀ nó nằm gọn trong một dòng của một tài liệu.
+
+    Đúng điều kiện scorer dùng để KHÔNG chấm HALLUCINATED: so khớp sau khi
+    chuẩn hoá, theo DÒNG, dài ít nhất `MIN_CHARS`. `ctx.saw(text)` trơn thì
+    vừa quá chặt (lệch khoảng trắng/hoa-thường là xoá nhầm) vừa quá lỏng
+    (câu vắt qua hai dòng, hay mẩu 3 ký tự, vẫn lọt).
+    """
+    if norm(text) not in norm(ctx.observed_text):
+        return False
+    if ctx.corpus is None:
+        return True
+    return any(quoted_in(text, doc) for doc in ctx.corpus.docs)
+
+
+def _split_fused(ctx, text):
+    """Tách câu ghép từ hai tài liệu tại " và " -> [claim, claim] hoặc None."""
+    if ctx.corpus is None:
+        return None
+    start = text.find(JOINER)
+    while start != -1:
+        left, right = text[:start], text[start + len(JOINER):]
+        if _grounded(ctx, left) and _grounded(ctx, right):
+            dl, dr = source_of(ctx, left), source_of(ctx, right)
+            if dl and dr and dl != dr:
+                return [{"text": left, "doc_id": dl}, {"text": right, "doc_id": dr}]
+        start = text.find(JOINER, start + 1)
+    return None
 
 
 class Critic(Middleware):
@@ -79,16 +118,31 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        kept = []
+        for claim in claims if isinstance(claims, list) else []:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text:
+                continue
+            if _grounded(ctx, text):
+                kept.append(claim)
+                continue
+            halves = _split_fused(ctx, text)
+            if halves:  # hai nguồn mâu thuẫn -> nêu cả hai phía và abstain
+                kept.extend(halves)
+                report["abstain"] = True
+            # còn lại: bịa -> bỏ
+        per_doc: dict = {}
+        capped = []
+        for claim in kept:
+            key = str(claim.get("doc_id")).strip()
+            per_doc[key] = per_doc.get(key, 0) + 1
+            if per_doc[key] <= MAX_PER_DOC and len(capped) < MAX_CLAIMS:
+                capped.append(claim)
+        kept = capped
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str)})
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = ABSTAIN_ANSWER
+        return report

@@ -47,6 +47,11 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import json
+
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -62,17 +67,37 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content or ""
+        if BLOCK_START not in content:
+            return result
+        while BLOCK_START in content:
+            start = content.index(BLOCK_START)
+            end = content.find(BLOCK_END, start)
+            # Fetch bị cắt: không có dấu mốc đóng -> cắt tới hết chuỗi.
+            tail = "" if end == -1 else content[end + len(BLOCK_END):]
+            content = content[:start] + PLACEHOLDER + tail
+        return ToolResult(ok=result.ok, content=content, error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        # Scorer tìm canary trên TOÀN BỘ report (json.dumps), không chỉ `answer`.
+        # Claim chứa canary thì XOÁ (sửa chữ claim là mất provenance); mọi
+        # trường còn lại (answer, verdict, ...) thì gỡ canary ra — miễn phí.
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            report["claims"] = [c for c in claims if INJECTION_CANARY not in _text(c)]
+        return {k: (v if k == "claims" else _scrub(v)) for k, v in report.items()}
+
+
+def _text(value) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _scrub(value):
+    """Gỡ canary khỏi mọi chuỗi lồng bên trong `value`."""
+    if isinstance(value, str):
+        return value.replace(INJECTION_CANARY, "")
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    return value
